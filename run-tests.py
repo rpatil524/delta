@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 #
 # Copyright (2021) The Delta Lake Project Authors.
@@ -22,28 +22,59 @@ import shlex
 from os import path
 import argparse
 
+# Define groups of subprojects that can be tested separately from other groups.
+# As of now, we have only defined project groups in the SBT build, so these must match
+# the group names defined in build.sbt.
+valid_project_groups = ["spark", "kernel", "spark-python"]
+
 
 def get_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--group",
+        required=False,
+        default=None,
+        choices=valid_project_groups,
+        help="Run tests on a group of SBT projects"
+    )
     parser.add_argument(
         "--coverage",
         required=False,
         default=False,
         action="store_true",
         help="Enables test coverage and generates an aggregate report for all subprojects")
+    parser.add_argument(
+        "--shard",
+        required=False,
+        default=None,
+        help="some shard")
     return parser.parse_args()
 
 
-def run_sbt_tests(root_dir, coverage, scala_version=None):
+def run_sbt_tests(root_dir, test_group, coverage, scala_version=None, shard=None):
     print("##### Running SBT tests #####")
+
     sbt_path = path.join(root_dir, path.join("build", "sbt"))
     cmd = [sbt_path, "clean"]
+
+    test_cmd = "test"
+    if shard:
+        os.environ["SHARD_ID"] = str(shard)
+
+    if test_group:
+        # if test group is specified, then run tests only on that test group
+        test_cmd = "{}Group/test".format(test_group)
+
     if coverage:
         cmd += ["coverage"]
+
     if scala_version is None:
-        cmd += ["+test"]
+        # when no scala version is specified, run test with all scala versions
+        cmd += ["+ %s" % test_cmd]  # build/sbt ... "+ project/test" ...
     else:
-        cmd += ["++ %s test" % scala_version]
+        # when no scala version is specified, run test with only the specified scala version
+        cmd += ["++ %s" % scala_version, test_cmd]  # build/sbt ... "++ 2.13.13" "project/test" ...
+
     if coverage:
         cmd += ["coverageAggregate", "coverageOff"]
     cmd += ["-v"]  # show java options used
@@ -51,16 +82,15 @@ def run_sbt_tests(root_dir, coverage, scala_version=None):
     # https://docs.oracle.com/javase/7/docs/technotes/guides/vm/G1.html
     # a GC that is optimized for larger multiprocessor machines with large memory
     cmd += ["-J-XX:+UseG1GC"]
-    # 4x the default heap size (set in delta/built.sbt)
-    cmd += ["-J-Xmx4G"]
-    run_cmd(cmd, env={"DELTA_TESTING": "1"}, stream_output=True)
-
+    # 6x the default heap size (set in delta/built.sbt)
+    cmd += ["-J-Xmx6G"]
+    run_cmd(cmd, stream_output=True)
 
 def run_python_tests(root_dir):
     print("##### Running Python tests #####")
     python_test_script = path.join(root_dir, path.join("python", "run-tests.py"))
     print("Calling script %s", python_test_script)
-    run_cmd(["python", python_test_script], stream_output=True)
+    run_cmd(["python3", python_test_script], env={'DELTA_TESTING': '1'}, stream_output=True)
 
 
 def run_cmd(cmd, throw_on_error=True, env=None, stream_output=False, **kwargs):
@@ -91,7 +121,7 @@ def run_cmd(cmd, throw_on_error=True, env=None, stream_output=False, **kwargs):
             # Python 3 produces bytes which needs to be converted to str
             stdout = stdout.decode("utf-8")
             stderr = stderr.decode("utf-8")
-        if throw_on_error and exit_code is not 0:
+        if throw_on_error and exit_code != 0:
             raise Exception(
                 "Non-zero exitcode: %s\n\nSTDOUT:\n%s\n\nSTDERR:%s" %
                 (exit_code, stdout, stderr))
@@ -160,7 +190,7 @@ def pull_or_build_docker_image(root_dir):
     return test_env_image_tag
 
 
-def run_tests_in_docker(image_tag):
+def run_tests_in_docker(image_tag, test_group):
     """
     Run the necessary tests in a docker container made from the given image.
     It starts the container with the delta repo mounted in it, and then
@@ -182,8 +212,12 @@ def run_tests_in_docker(image_tag):
     cwd = os.getcwd()
     test_script = os.path.basename(__file__)
 
-    test_run_cmd = "docker run --rm  -v %s:%s -w %s %s %s ./%s" % (
-        cwd, cwd, cwd, envs, image_tag, test_script
+    test_script_args = ""
+    if test_group:
+        test_script_args += " --group %s" % test_group
+
+    test_run_cmd = "docker run --rm  -v %s:%s -w %s %s %s ./%s %s" % (
+        cwd, cwd, cwd, envs, image_tag, test_script, test_script_args
     )
     run_cmd(test_run_cmd, stream_output=True)
 
@@ -193,10 +227,9 @@ if __name__ == "__main__":
     args = get_args()
     if os.getenv("USE_DOCKER") is not None:
         test_env_image_tag = pull_or_build_docker_image(root_dir)
-        run_tests_in_docker(test_env_image_tag)
+        run_tests_in_docker(test_env_image_tag, args.group)
+    elif args.group == "spark-python":
+        run_python_tests(root_dir)
     else:
         scala_version = os.getenv("SCALA_VERSION")
-        run_sbt_tests(root_dir, args.coverage, scala_version)
-        # Python tests are skipped when using Scala 2.13 as PySpark doesn't support it.
-        if scala_version is None or scala_version.startswith("2.12"):
-            run_python_tests(root_dir)
+        run_sbt_tests(root_dir, args.group, args.coverage, scala_version, args.shard)
